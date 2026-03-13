@@ -1,0 +1,17 @@
+.{
+    .name = "buongiorno",
+    .version = "0.1.3",
+    .paths = .{
+        ".",
+    },
+    .dependencies = .{
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.9.1.tar.gz",
+            .hash = "122062d301a203d003547b414237229b09a7980095061697349f8bef41be9c30266b",
+        },
+        .spoon = .{
+            .url = "https://git.sr.ht/~leon_plickat/zig-spoon/archive/fdba8e643c9558254bf4e6c600dfbd782fa7a267.tar.gz",
+            .hash = "12202727aaaf0e742d4945be55af1ace8b25902095e0c1b0a24b70cc80a81b7ac518",
+        },
+    },
+}

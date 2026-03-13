@@ -1,0 +1,19 @@
+image: alpine/edge
+packages:
+  - hut
+sources:
+  - https://git.sr.ht/~andreafeletto/buongiorno
+secrets:
+  - 29a0fb3d-a6c2-4abb-a48a-f6de6c7deacf
+tasks:
+  - zig: |
+      curl -sO https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+      unxz zig-linux-x86_64-0.13.0.tar.xz
+      tar xf zig-linux-x86_64-0.13.0.tar
+      mv zig-linux-x86_64-0.13.0 zig
+  - fmt: |
+      cd buongiorno
+      ~/zig/zig fmt --check src/
+  - build: |
+      cd buongiorno
+      ~/zig/zig build
