@@ -8,65 +8,76 @@
     };
   };
 
-  outputs = { nixpkgs, flake-utils, ... }:
-  let
-    overlays = [
-      (final: prev: {
-        buongiorno = prev.callPackage ./nix/package.nix {};
-      })
-    ];
-  in
-  flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      ...
+    }:
     let
-      pkgs = import nixpkgs { inherit overlays system; };
+      overlays = [
+        (final: prev: {
+          buongiorno = prev.callPackage ./nix/package.nix { };
+        })
+      ];
     in
     {
-      packages.default = pkgs.buongiorno;
+      overlays.default = builtins.head overlays;
 
-      devShells.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [
-          zig
-        ];
-      };
+      nixosModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
+        let
+          cfg = config.programs.buongiorno;
+        in
+        {
+          options.programs.buongiorno = {
+            enable = lib.mkEnableOption "buongiorno" // {
+              description = ''
+                Configure greetd to use buongiorno as greeter.
+                This sets `services.greetd.enable` to `true` and sets
+                `services.greetd.default_session.command`.
+              '';
+            };
 
-      nixosModules.default = { config, lib, ... }:
+            command = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+            };
+
+            username = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+            };
+          };
+
+          config = lib.mkIf cfg.enable {
+            nixpkgs.overlays = [ self.overlays.default ];
+
+            services.greetd = {
+              enable = true;
+              settings.default_session.command = "${pkgs.buongiorno}/bin/buongiorno -u '${cfg.username}' -c '${cfg.command}'";
+            };
+          };
+        };
+
+    }
+    // flake-utils.lib.eachDefaultSystem (
+      system:
       let
-        cfg = config.programs.buongiorno;
+        pkgs = import nixpkgs { inherit system overlays; };
       in
       {
-        options.programs.buongiorno = {
-          enable = lib.mkEnableOption "buongiorno" // {
-            description = ''
-              Configure greetd to use buongiorno as greeter.
-              This sets `services.greetd.enable` to `true` and sets `services.greetd.default_session.command`.
-              See also `programs.buongiorno.command` and `programs.buongiorno.username`.
-            '';
-          };
-          command = lib.mkOption {
-            type = lib.types.str;
-            default = "";
-            description = ''
-              Append `-c '<command>'` to `services.greetd.default_session.command`.
-              Note that single quotes are always added around the value.
-            '';
-          };
-          username = lib.mkOption {
-            type = lib.types.str;
-            default = "";
-            description = ''
-              Append `-u '<username>'` to `services.greetd.default_session.command`.
-              Note that single quotes are always added around the value.
-            '';
-          };
-        };
+        packages.default = pkgs.buongiorno;
 
-        config = lib.mkIf cfg.enable {
-          services.greetd = {
-            enable = true;
-            settings.default_session.command = "${pkgs.buongiorno}/bin/buongiorno -u '${cfg.username}' -c '${cfg.command}'";
-          };
+        devShells.default = pkgs.mkShell {
+          nativeBuildInputs = with pkgs; [ zig ];
         };
-      };
-    }
-  );
+      }
+    );
 }
