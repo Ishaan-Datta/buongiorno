@@ -76,7 +76,7 @@
         packages.default = pkgs.buongiorno;
 
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ zig ];
+          nativeBuildInputs = with pkgs; [ zig_0_13 ];
         };
       }
     );
