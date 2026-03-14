@@ -1,7 +1,9 @@
-{ stdenv
-, callPackage
-, zig_0_13
+{
+  stdenv,
+  callPackage,
+  zig_0_13,
 }:
+
 stdenv.mkDerivation {
   pname = "buongiorno";
   version = "0.1.3";
@@ -12,7 +14,10 @@ stdenv.mkDerivation {
     zig_0_13.hook
   ];
 
+  ZIG_GLOBAL_CACHE_DIR = ".zig-cache";
+
   postPatch = ''
-    ln -s ${callPackage ./deps.nix {}} $ZIG_GLOBAL_CACHE_DIR/p
+    mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+    ln -s ${callPackage ./deps.nix { }} "$ZIG_GLOBAL_CACHE_DIR/p"
   '';
 }
