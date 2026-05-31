@@ -83,15 +83,6 @@ pub fn main() !void {
         return;
     };
 
-    const socket = std.net.connectUnixSocket(socket_path) catch {
-        std.log.err("could not connect to socket at {s}", .{socket_path});
-        return;
-    };
-    defer socket.close();
-
-    const stdout = std.io.getStdOut().writer();
-    try stdout.writeAll("hello");
-
     try loop.init();
     defer loop.deinit();
 
@@ -99,15 +90,27 @@ pub fn main() !void {
         const action = try loop.run();
         switch (action) {
             .login => |fields| {
+                const socket = std.net.connectUnixSocket(socket_path) catch {
+                    std.log.err("could not connect to socket at {s}", .{socket_path});
+                    try loop.reset();
+                    continue;
+                };
+                defer socket.close();
+
                 var login: ipc.Login = .{
                     .request = .{ .create_session = .{ .username = fields.username } },
                     .password = fields.password,
                     .command = command,
                 };
-                const reaction = try login.run(allocator, socket);
+
+                const reaction = login.run(allocator, socket) catch |err| {
+                    std.log.err("login IPC failed: {s}", .{@errorName(err)});
+                    try loop.resetAfterFailedLogin();
+                    continue;
+                };
                 switch (reaction) {
                     .ok => return,
-                    .failed => try loop.reset(),
+                    .failed => try loop.resetAfterFailedLogin(),
                 }
             },
             .power => |subcommand| {
