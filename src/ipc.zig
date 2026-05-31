@@ -8,6 +8,7 @@ pub const Login = struct {
     password: []const u8,
     command: []const u8,
     command_sent: bool = false,
+    password_sent: bool = false,
 
     const Reaction = enum {
         ok,
@@ -16,11 +17,16 @@ pub const Login = struct {
 
     pub fn run(self: *Login, allocator: std.mem.Allocator, stream: std.net.Stream) !Reaction {
         while (true) {
-            try self.request.writeTo(allocator, stream.writer().any());
-            if (self.request == .cancel_session) return .failed;
+            const sent_request = self.request;
+
+            try sent_request.writeTo(allocator, stream.writer().any());
 
             const response = try Response.readFrom(allocator, stream.reader());
             defer response.deinit(allocator);
+
+            if (sent_request == .cancel_session) {
+                return .failed;
+            }
 
             switch (response) {
                 .success => {
@@ -34,15 +40,36 @@ pub const Login = struct {
                         } };
                     }
                 },
-                .@"error" => {
+                .@"error" => |err| {
+                    std.log.warn("greetd returned {s}: {s}", .{
+                        @tagName(err.error_type),
+                        err.description,
+                    });
+
                     self.request = .cancel_session;
                 },
                 .auth_message => |data| {
                     self.request = switch (data.auth_message_type) {
-                        .secret => .{ .post_auth_message_response = .{
-                            .response = self.password,
-                        } },
-                        else => .cancel_session,
+                        .secret => blk: {
+                            if (self.password_sent) {
+                                break :blk .cancel_session;
+                            }
+
+                            self.password_sent = true;
+                            break :blk .{
+                                .post_auth_message_response = .{
+                                    .response = self.password,
+                                },
+                            };
+                        },
+
+                        .info, .@"error" => .{
+                            .post_auth_message_response = .{
+                                .response = null,
+                            },
+                        },
+
+                        .visible => .cancel_session,
                     };
                 },
             }
@@ -69,7 +96,7 @@ pub const Request = union(enum) {
 
         switch (self) {
             .cancel_session => {
-                try payload.appendSlice("{{\"type\":\"cancel_session\"}}");
+                try payload.appendSlice("{\"type\":\"cancel_session\"}");
             },
             inline else => |data| {
                 const content = try std.json.stringifyAlloc(allocator, data, .{});
@@ -117,6 +144,7 @@ pub const Response = union(enum) {
             if (std.mem.eql(u8, field.name, partial.value.type)) {
                 const parsed = try std.json.parseFromSliceLeaky(field.type, allocator, payload, .{
                     .ignore_unknown_fields = true,
+                    .allocate = .alloc_always,
                 });
                 return @unionInit(Response, field.name, parsed);
             }

@@ -78,6 +78,18 @@ pub const Loop = struct {
         try self.context.done();
     }
 
+    pub fn resetAfterFailedLogin(self: *Loop) !void {
+        self.mode = .insert;
+        self.view = .home;
+        self.field = .password;
+        self.password.len = 0;
+        self.cursor = 0;
+
+        self.context = try self.term.getRenderContext();
+        try self.renderHome();
+        try self.context.done();
+    }
+
     pub fn run(self: *Loop) !Action {
         try self.term.fetchSize();
 
