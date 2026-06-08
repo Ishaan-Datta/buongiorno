@@ -103,7 +103,16 @@ pub const Loop = struct {
 
         var buffer: [32]u8 = undefined;
         while (true) {
-            _ = try std.posix.poll(&fds, -1);
+            fds[0].revents = 0;
+            
+            const ready = try std.posix.poll(&fds, 100);
+            if (ready == 0) {
+                try self.redrawIfResized();
+                continue;
+            }
+
+            if ((fds[0].revents & std.posix.POLL.IN) == 0) continue;
+
             const size = try self.term.readInput(&buffer);
             var inputs = spoon.inputParser(buffer[0..size]);
 
@@ -273,6 +282,26 @@ pub const Loop = struct {
             const cursor_x = hpad + 2 + @min(self.cursor, title_width - 5);
             try rc.moveCursorTo(cursor_y, cursor_x);
             try rc.showCursor();
+        }
+    }
+
+    fn redrawIfResized(self: *Loop) !void {
+        const old_width = self.term.width;
+        const old_height = self.term.height;
+    
+        try self.term.fetchSize();
+    
+        if (self.term.width == old_width and self.term.height == old_height) {
+            return;
+        }
+    
+        self.context = try self.term.getRenderContext();
+        defer self.context.done() catch {};
+    
+        try self.renderHome();
+    
+        if (self.view == .power) {
+            try self.renderPower();
         }
     }
 
