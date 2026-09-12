@@ -5,7 +5,6 @@ const spoon = @import("spoon");
 
 const ipc = @import("ipc.zig");
 const ui = @import("ui.zig");
-
 pub fn logFn(
     comptime level: std.log.Level,
     comptime _: @TypeOf(.enum_literal),
@@ -22,7 +21,6 @@ pub fn logFn(
     const msg = std.fmt.bufPrintZ(&buffer, format, args) catch unreachable;
     std.c.syslog(syslog_level, "%s", msg.ptr);
 }
-
 pub const std_options: std.Options = .{
     .logFn = logFn,
 };
@@ -38,15 +36,14 @@ pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-
     const stderr = std.io.getStdErr().writer();
     const template = comptime clap.parseParamsComptime(
         \\-h, --help           Display this help and exit.
         \\-c, --command <str>  Command to run on successful login.
         \\-u, --user <str>     Set default username.
+        \\-o, --output <str>   DRM connector used to size the Linux virtual console.
         \\
     );
-
     var diagnostic: clap.Diagnostic = .{};
     const params = clap.parse(clap.Help, &template, clap.parsers.default, .{
         .diagnostic = &diagnostic,
@@ -56,7 +53,6 @@ pub fn main() !void {
         return;
     };
     defer params.deinit();
-
     if (params.args.help != 0) {
         return clap.help(stderr, clap.Help, &template, .{});
     }
@@ -71,7 +67,6 @@ pub fn main() !void {
 
     var envmap = try std.process.getEnvMap(allocator);
     defer envmap.deinit();
-
     const usernames = try getUsernames(allocator);
     defer {
         for (usernames) |username| allocator.free(username);
@@ -83,9 +78,8 @@ pub fn main() !void {
         return;
     };
 
-    try loop.init();
+    try loop.init(params.args.output);
     defer loop.deinit();
-
     while (true) {
         const action = try loop.run();
         switch (action) {
@@ -96,13 +90,11 @@ pub fn main() !void {
                     continue;
                 };
                 defer socket.close();
-
                 var login: ipc.Login = .{
                     .request = .{ .create_session = .{ .username = fields.username } },
                     .password = fields.password,
                     .command = command,
                 };
-
                 const reaction = login.run(allocator, socket) catch |err| {
                     std.log.err("login IPC failed: {s}", .{@errorName(err)});
                     try loop.resetAfterFailedLogin();
@@ -123,14 +115,12 @@ pub fn main() !void {
         }
     }
 }
-
 fn getUsernames(allocator: std.mem.Allocator) ![][]const u8 {
     var usernames = std.ArrayList([]const u8).init(allocator);
 
     passwd: {
         const passwd = std.fs.openFileAbsolute("/etc/passwd", .{}) catch break :passwd;
         defer passwd.close();
-
         var buffer: [128]u8 = undefined;
         while (try passwd.reader().readUntilDelimiterOrEof(&buffer, '\n')) |line| {
             var fields = std.mem.split(u8, line, ":");
@@ -139,7 +129,6 @@ fn getUsernames(allocator: std.mem.Allocator) ![][]const u8 {
             try usernames.append(username);
         }
     }
-
     homectl: {
         const result = std.process.Child.run(.{
             .allocator = allocator,
@@ -149,7 +138,6 @@ fn getUsernames(allocator: std.mem.Allocator) ![][]const u8 {
             allocator.free(result.stdout);
             allocator.free(result.stderr);
         }
-
         var lines = std.mem.split(u8, result.stdout, "\n");
         while (lines.next()) |line| {
             var fields = std.mem.split(u8, line, " ");
@@ -162,7 +150,6 @@ fn getUsernames(allocator: std.mem.Allocator) ![][]const u8 {
 
     return usernames.toOwnedSlice();
 }
-
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     @setCold(true);
     loop.term.cook() catch {};

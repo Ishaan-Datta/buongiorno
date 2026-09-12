@@ -6,26 +6,28 @@ const os = std.os;
 const time = std.time;
 
 const spoon = @import("spoon");
-
+const console = @import("console.zig");
 const title =
-    \\ ____  _   _  ___  _   _  ____ ___ ___  ____  _   _  ___  
-    \\| __ )| | | |/ _ \| \ | |/ ___|_ _/ _ \|  _ \| \ | |/ _ \ 
+    \\ ____  _   _  ___  _   _  ____ ___ ___  ____  _   _  ___
+    \\| __ )| | | |/ _ \| \ | |/ ___|_ _/ _ \|  _ \| \ | |/ _ \
     \\|  _ \| | | | | | |  \| | |  _ | | | | | |_) |  \| | | | |
     \\| |_) | |_| | |_| | |\  | |_| || | |_| |  _ <| |\  | |_| |
-    \\|____/ \___/ \___/|_| \_|\____|___\___/|_| \_\_| \_|\___/ 
+    \\|____/ \___/ \___/|_| \_|\____|___\___/|_| \_\_| \_|\___/
 ;
-
 const splash =
-    \\ _     ___   ____  ____ ___ _   _  ____     ___ _   _               
-    \\| |   / _ \ / ___|/ ___|_ _| \ | |/ ___|   |_ _| \ | |              
-    \\| |  | | | | |  _| |  _ | ||  \| | |  _     | ||  \| |              
-    \\| |__| |_| | |_| | |_| || || |\  | |_| |    | || |\  |    _   _   _ 
+    \\ _     ___   ____  ____ ___ _   _  ____     ___ _   _
+    \\| |   / _ \ / ___|/ ___|_ _| \ | |/ ___|   |_ _| \ | |
+    \\| |  | | | | |  _| |  _ | ||  \| | |  _     | ||  \| |
+    \\| |__| |_| | |_| | |_| || || |\  | |_| |    | || |\  |    _   _   _
     \\|_____\___/ \____|\____|___|_| \_|\____|   |___|_| \_|   (_) (_) (_)
 ;
-
 pub const Loop = struct {
     term: spoon.Term,
     context: spoon.Term.RenderContext = undefined,
+    drm_output: ?[]const u8 = null,
+    drm_sync_ticks: u8 = 0,
+    drm_ambiguity_logged: bool = false,
+    drm_error_logged: bool = false,
     mode: enum { insert, select },
     view: enum { home, power },
     field: enum { username, password },
@@ -33,7 +35,6 @@ pub const Loop = struct {
     username: std.BoundedArray(u8, 1024) = .{},
     password: std.BoundedArray(u8, 1024) = .{},
     cursor: usize = 0,
-
     const Action = union(enum) {
         login: struct {
             username: []const u8,
@@ -42,19 +43,29 @@ pub const Loop = struct {
         power: []const u8,
     };
 
-    pub fn init(self: *Loop) !void {
+    pub fn init(self: *Loop, drm_output: ?[]const u8) !void {
+        self.drm_output = drm_output;
+
         try self.term.init(.{});
         try self.term.uncook(.{
             .request_kitty_keyboard_protocol = false,
             .request_mouse_tracking = false,
         });
-        try self.term.fetchSize();
 
+        // Native DRM may already be ready by the time greetd starts.
+        _ = self.syncDrmOutput(true);
+
+        try self.term.fetchSize();
         self.context = try self.term.getRenderContext();
         try self.context.clear();
         try self.context.done();
 
         time.sleep(100 * time.ns_per_ms);
+
+        // Try again after the existing startup delay. If the machine is still
+        // transitioning from SimpleDRM to its native DRM driver, run() keeps
+        // retrying every ~500 ms below.
+        _ = self.syncDrmOutput(true);
 
         self.context = try self.term.getRenderContext();
         try self.renderHome();
@@ -64,7 +75,6 @@ pub const Loop = struct {
     pub fn deinit(self: *Loop) void {
         self.term.deinit() catch unreachable;
     }
-
     pub fn reset(self: *Loop) !void {
         self.mode = .insert;
         self.view = .home;
@@ -77,7 +87,6 @@ pub const Loop = struct {
         try self.renderHome();
         try self.context.done();
     }
-
     pub fn resetAfterFailedLogin(self: *Loop) !void {
         self.mode = .insert;
         self.view = .home;
@@ -92,7 +101,6 @@ pub const Loop = struct {
 
     pub fn run(self: *Loop) !Action {
         try self.term.fetchSize();
-
         var fds = [_]std.posix.pollfd{
             .{
                 .fd = self.term.tty.?,
@@ -104,13 +112,12 @@ pub const Loop = struct {
         var buffer: [32]u8 = undefined;
         while (true) {
             fds[0].revents = 0;
-            
+
             const ready = try std.posix.poll(&fds, 100);
             if (ready == 0) {
                 try self.redrawIfResized();
                 continue;
             }
-
             if ((fds[0].revents & std.posix.POLL.IN) == 0) continue;
 
             const size = try self.term.readInput(&buffer);
@@ -118,7 +125,6 @@ pub const Loop = struct {
 
             self.context = try self.term.getRenderContext();
             defer self.context.done() catch {};
-
             while (inputs.next()) |input| {
                 switch (self.view) {
                     .home => switch (self.mode) {
@@ -197,7 +203,6 @@ pub const Loop = struct {
                     },
                     .power => {
                         debug.assert(self.mode == .select);
-
                         if (input.eqlDescription("escape")) {
                             self.view = .home;
                             try self.renderBar();
@@ -219,7 +224,6 @@ pub const Loop = struct {
             }
         }
     }
-
     fn renderHome(self: *Loop) !void {
         try self.term.fetchSize();
         const rc = &self.context;
@@ -233,7 +237,6 @@ pub const Loop = struct {
         const field_spacing = 1;
         const field_height = 4;
         const region_height = title_height + title_spacing + field_height * 2 + field_spacing;
-
         const bar_height = 2;
         const vpad = (self.term.height - bar_height - region_height) / 2;
         const hpad = (self.term.width - title_width) / 2;
@@ -244,13 +247,11 @@ pub const Loop = struct {
             try rc.moveCursorTo(vpad + i, hpad);
             try rc.writeAllWrapping(line);
         }
-
         const username_top = vpad + title_height + title_spacing;
         const password_top = username_top + field_height + field_spacing;
 
         const username = self.username.constSlice();
         const password = self.password.constSlice();
-
         try drawField(rc, username, .{
             .label = "username",
             .hidden = false,
@@ -271,7 +272,6 @@ pub const Loop = struct {
             .left = hpad,
             .top = password_top,
         });
-
         try self.renderBar();
 
         if (self.view == .home and self.mode == .insert) {
@@ -284,27 +284,78 @@ pub const Loop = struct {
             try rc.showCursor();
         }
     }
+    fn syncDrmOutput(self: *Loop, force: bool) bool {
+        if (!force) {
+            if (self.drm_sync_ticks > 0) {
+                self.drm_sync_ticks -= 1;
+                return false;
+            }
+        }
 
+        // redrawIfResized() runs every 100 ms while idle. Four skipped ticks
+        // means one DRM/VC synchronization attempt roughly every 500 ms.
+        self.drm_sync_ticks = 4;
+
+        const result = console.syncTerminalToOutput(
+            self.term.tty.?,
+            self.drm_output,
+        ) catch |err| {
+            if (!self.drm_error_logged) {
+                std.log.warn(
+                    "failed to synchronize virtual-console geometry: {s}",
+                    .{@errorName(err)},
+                );
+                self.drm_error_logged = true;
+            }
+            return false;
+        };
+
+        switch (result) {
+            .not_ready => return false,
+            .ambiguous => {
+                if (!self.drm_ambiguity_logged) {
+                    std.log.warn(
+                        "multiple connected DRM outputs; pass --output <connector> to select one",
+                        .{},
+                    );
+                    self.drm_ambiguity_logged = true;
+                }
+                return false;
+            },
+            .unchanged => return false,
+            .resized => {
+                self.drm_error_logged = false;
+                std.log.info(
+                    "synchronized virtual-console geometry with DRM output",
+                    .{},
+                );
+                return true;
+            },
+        }
+    }
     fn redrawIfResized(self: *Loop) !void {
         const old_width = self.term.width;
         const old_height = self.term.height;
-    
+
+        const drm_resized = self.syncDrmOutput(false);
+
         try self.term.fetchSize();
-    
-        if (self.term.width == old_width and self.term.height == old_height) {
+
+        if (!drm_resized and
+            self.term.width == old_width and self.term.height == old_height)
+        {
             return;
         }
-    
+
         self.context = try self.term.getRenderContext();
         defer self.context.done() catch {};
-    
+
         try self.renderHome();
-    
+
         if (self.view == .power) {
             try self.renderPower();
         }
     }
-
     fn renderPower(self: *Loop) !void {
         const rc = &self.context;
         try rc.hideCursor();
@@ -322,7 +373,6 @@ pub const Loop = struct {
             .left = hpad,
             .top = vpad,
         });
-
         try drawText(rc, "shutdown", .{
             .hidden = false,
             .selected = self.power == .shutdown,
@@ -334,7 +384,6 @@ pub const Loop = struct {
             .left = hpad + 1,
             .top = vpad + 1,
         });
-
         try drawText(rc, "reboot", .{
             .hidden = false,
             .selected = self.power == .reboot,
@@ -351,13 +400,11 @@ pub const Loop = struct {
     fn renderBar(self: *Loop) !void {
         const rc = &self.context;
         try rc.hideCursor();
-
         try rc.moveCursorTo(self.term.height - 2, 0);
         var i: usize = 0;
         while (i < self.term.width) : (i += 1) {
             try rc.writeAllWrapping("\u{2500}");
         }
-
         const mode = switch (self.mode) {
             .insert => "INSERT",
             .select => "SELECT",
@@ -372,7 +419,6 @@ pub const Loop = struct {
                 .power => "enter: commit, j: down, k: up",
             },
         };
-
         try rc.moveCursorTo(self.term.height - 1, 1);
         var rpw = rc.restrictedPaddingWriter(self.term.width - 2);
         const writer = rpw.writer();
@@ -387,7 +433,6 @@ pub const Loop = struct {
         const rc = &self.context;
         try rc.clear();
         try rc.hideCursor();
-
         const splash_height = mem.count(u8, splash, "\n") + 1;
         const splash_width = mem.indexOfScalar(u8, splash, '\n').?;
 
@@ -402,7 +447,6 @@ pub const Loop = struct {
         }
     }
 };
-
 const Box = struct {
     width: usize,
     height: usize,
@@ -422,7 +466,6 @@ fn drawBox(rc: *spoon.Term.RenderContext, box: Box) !void {
 
         try rpw.finish();
     }
-
     var row: usize = 1;
     while (row < box.height - 1) : (row += 1) {
         try rc.moveCursorTo(box.top + row, box.left);
@@ -436,7 +479,6 @@ fn drawBox(rc: *spoon.Term.RenderContext, box: Box) !void {
         try rc.moveCursorTo(box.top + box.height - 1, box.left);
         var rpw = rc.restrictedPaddingWriter(box.width);
         const writer = rpw.writer();
-
         try writer.writeAll("\u{2514}");
         while (rpw.len_left > 1) try writer.writeAll("\u{2500}");
         try writer.writeAll("\u{2518}");
@@ -451,7 +493,6 @@ const TextOptions = struct {
     halign: enum { left, center, right },
     valign: enum { top, center, bottom },
 };
-
 fn drawText(rc: *spoon.Term.RenderContext, text: []const u8, options: TextOptions, box: Box) !void {
     const tail_len = @min(text.len, box.width - 1);
     const tail = text[text.len - tail_len ..];
@@ -466,7 +507,6 @@ fn drawText(rc: *spoon.Term.RenderContext, text: []const u8, options: TextOption
         .center => box.height / 2,
         .bottom => box.height - 1,
     };
-
     try rc.setAttribute(.{ .reverse = options.selected });
 
     var line: usize = 0;
@@ -480,7 +520,6 @@ fn drawText(rc: *spoon.Term.RenderContext, text: []const u8, options: TextOption
     try rc.moveCursorTo(box.top + vpad, box.left);
     var rpw = rc.restrictedPaddingWriter(box.width);
     const writer = rpw.writer();
-
     try writer.writeByteNTimes(' ', hpad);
     for (tail) |char| {
         const codepoint: []const u8 = if (options.hidden) "\u{2022}" else &.{char};
@@ -495,7 +534,6 @@ const FieldOptions = struct {
     hidden: bool,
     selected: bool,
 };
-
 fn drawField(rc: *spoon.Term.RenderContext, text: []const u8, options: FieldOptions, box: Box) !void {
     try rc.moveCursorTo(box.top, box.left + 1);
     try rc.writeAllWrapping(options.label);
@@ -506,7 +544,6 @@ fn drawField(rc: *spoon.Term.RenderContext, text: []const u8, options: FieldOpti
         .left = box.left,
         .top = box.top + 1,
     });
-
     try drawText(rc, text, .{
         .hidden = options.hidden,
         .selected = options.selected,

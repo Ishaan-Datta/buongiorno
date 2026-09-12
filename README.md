@@ -22,6 +22,30 @@ sudo zig build --release=safe --prefix /usr
 sudo install -d /var/cache/buongiorno -o greeter -g greeter
 ```
 
+## Usage
+
+For a machine with exactly one connected native DRM output, no new option is needed.
+
+For a machine with multiple connected outputs, pass the connector explicitly, for example:
+
+```sh
+buongiorno -o DP-1 -u ishaan -c startplasma-wayland
+```
+
+List connected connectors with:
+
+```sh
+for output in /sys/class/drm/card*-*; do
+  [ -f "$output/status" ] || continue
+  [ "$(cat "$output/status")" = connected ] || continue
+  printf '%s: ' "$(basename "$output")"
+  head -n1 "$output/modes"
+done
+```
+
+The `-o` value is the connector portion such as `DP-1`, `HDMI-A-1`, or `eDP-1`, not `card0-DP-1`.
+
+
 ## Configuration
 
 The following `/etc/greetd/config.toml` sets "andrea" as the dafault user and
