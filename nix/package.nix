@@ -19,4 +19,11 @@ stdenv.mkDerivation {
     mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
     ln -sfn ${callPackage ./deps.nix { }} "$ZIG_GLOBAL_CACHE_DIR/p"
   '';
+
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+    zig build test
+    runHook postCheck
+  '';
 }

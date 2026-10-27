@@ -1,0 +1,60 @@
+name: Build and publish Nix cache
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: nix-cache
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build x86_64-linux
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build buongiorno
+        run: nix build -L .#packages.x86_64-linux.default --out-link result-x86_64-linux
+
+      - name: Save Nix cache
+        uses: Ishaan-Datta/static-nix-cache/save@v1.2.0
+        with:
+          name: x86_64-linux
+          paths: result-x86_64-linux
+
+  deploy:
+    name: Publish Nix cache
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.cache.outputs.page-url }}
+
+    steps:
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Deploy Nix cache
+        id: cache
+        uses: Ishaan-Datta/static-nix-cache/deploy@v1.2.0
+        with:
+          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          prune: true

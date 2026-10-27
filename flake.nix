@@ -71,12 +71,34 @@
       system:
       let
         pkgs = import nixpkgs { inherit system overlays; };
+        zigDeps = pkgs.callPackage ./nix/deps.nix { };
       in
       {
         packages.default = pkgs.buongiorno;
 
+        checks = {
+          formatting = pkgs.runCommand "buongiorno-formatting" { nativeBuildInputs = [ pkgs.zig_0_13 ]; } ''
+            cp -r ${./.} source
+            chmod -R u+w source
+            cd source
+            export HOME="$TMPDIR"
+            export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+            mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+            zig fmt --check build.zig build.zig.zon src
+            touch "$out"
+          '';
+          tests = pkgs.buongiorno;
+        };
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [ zig_0_13 ];
+
+          shellHook = ''
+            export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
+            mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+            rm -rf "$ZIG_GLOBAL_CACHE_DIR/p"
+            ln -s ${zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
+          '';
         };
       }
     );

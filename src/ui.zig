@@ -1,12 +1,12 @@
 const std = @import("std");
 const ascii = std.ascii;
-const debug = std.debug;
 const mem = std.mem;
 const os = std.os;
 const time = std.time;
 
 const spoon = @import("spoon");
 const console = @import("console.zig");
+const PowerAction = enum { reboot, firmware, shutdown };
 const title =
     \\ ____  _   _  ___  _   _  ____ ___ ___  ____  _   _  ___
     \\| __ )| | | |/ _ \| \ | |/ ___|_ _/ _ \|  _ \| \ | |/ _ \
@@ -28,19 +28,34 @@ pub const Loop = struct {
     drm_sync_ticks: u8 = 0,
     drm_ambiguity_logged: bool = false,
     drm_error_logged: bool = false,
-    mode: enum { insert, select },
-    view: enum { home, power },
-    field: enum { username, password },
-    power: enum { shutdown, reboot } = .shutdown,
+    view: enum { home, power } = .home,
+    field: enum { username, password } = .username,
+    power: PowerAction = .reboot,
     username: std.BoundedArray(u8, 1024) = .{},
     password: std.BoundedArray(u8, 1024) = .{},
-    cursor: usize = 0,
+    username_cursor: usize = 0,
+    password_cursor: usize = 0,
+    select_all: bool = false,
+    pending_input: std.BoundedArray(u8, 64) = .{},
+    const Key = union(enum) {
+        escape,
+        enter,
+        tab,
+        back_tab,
+        backspace,
+        left,
+        right,
+        up,
+        down,
+        select_all,
+        character: u8,
+    };
     const Action = union(enum) {
         login: struct {
             username: []const u8,
             password: []const u8,
         },
-        power: []const u8,
+        power: PowerAction,
     };
 
     pub fn init(self: *Loop, drm_output: ?[]const u8) !void {
@@ -51,6 +66,14 @@ pub const Loop = struct {
             .request_kitty_keyboard_protocol = false,
             .request_mouse_tracking = false,
         });
+
+        // Spoon disables DECARM while entering raw mode; login fields need
+        // the terminal to keep generating repeated keys while they are held.
+        const enable_auto_repeat = "\x1b[?8h";
+        var written: usize = 0;
+        while (written < enable_auto_repeat.len) {
+            written += try std.posix.write(self.term.tty.?, enable_auto_repeat[written..]);
+        }
 
         // Native DRM may already be ready by the time greetd starts.
         _ = self.syncDrmOutput(true);
@@ -76,23 +99,24 @@ pub const Loop = struct {
         self.term.deinit() catch unreachable;
     }
     pub fn reset(self: *Loop) !void {
-        self.mode = .insert;
         self.view = .home;
         self.field = .username;
         self.username.len = 0;
         self.password.len = 0;
-        self.cursor = 0;
+        self.username_cursor = 0;
+        self.password_cursor = 0;
+        self.select_all = false;
 
         self.context = try self.term.getRenderContext();
         try self.renderHome();
         try self.context.done();
     }
     pub fn resetAfterFailedLogin(self: *Loop) !void {
-        self.mode = .insert;
         self.view = .home;
         self.field = .password;
         self.password.len = 0;
-        self.cursor = 0;
+        self.password_cursor = 0;
+        self.select_all = false;
 
         self.context = try self.term.getRenderContext();
         try self.renderHome();
@@ -115,114 +139,186 @@ pub const Loop = struct {
 
             const ready = try std.posix.poll(&fds, 100);
             if (ready == 0) {
+                if (self.pending_input.len > 0) {
+                    self.context = try self.term.getRenderContext();
+                    defer self.context.done() catch {};
+                    if (try self.processPendingInput(true)) |action| return action;
+                }
                 try self.redrawIfResized();
                 continue;
             }
             if ((fds[0].revents & std.posix.POLL.IN) == 0) continue;
 
             const size = try self.term.readInput(&buffer);
-            var inputs = spoon.inputParser(buffer[0..size]);
+            self.pending_input.appendSlice(buffer[0..size]) catch {
+                self.pending_input.len = 0;
+                continue;
+            };
 
             self.context = try self.term.getRenderContext();
             defer self.context.done() catch {};
-            while (inputs.next()) |input| {
-                switch (self.view) {
-                    .home => switch (self.mode) {
-                        .insert => {
-                            if (input.eqlDescription("escape")) {
-                                self.mode = .select;
-                                try self.renderBar();
-                                try self.renderHome();
-                            } else if (input.eqlDescription("enter")) {
-                                switch (self.field) {
-                                    .username => {
-                                        self.field = .password;
-                                        self.cursor = 0;
-                                        try self.renderBar();
-                                        try self.renderHome();
-                                    },
-                                    .password => {
-                                        try self.renderSplash();
-                                        return .{ .login = .{
-                                            .username = self.username.constSlice(),
-                                            .password = self.password.constSlice(),
-                                        } };
-                                    },
-                                }
-                            } else if (input.eqlDescription("backspace") and self.cursor > 0) {
-                                switch (self.field) {
-                                    .username => _ = self.username.orderedRemove(self.cursor - 1),
-                                    .password => _ = self.password.orderedRemove(self.cursor - 1),
-                                }
-                                self.cursor -= 1;
-                                try self.renderHome();
-                            } else if (size == 1 and ascii.isPrint(buffer[0])) {
-                                const char = buffer[0];
-                                switch (self.field) {
-                                    .username => self.username.insert(self.cursor, char) catch {},
-                                    .password => self.password.insert(self.cursor, char) catch {},
-                                }
-                                self.cursor += 1;
-                                try self.renderHome();
-                            }
-                        },
-                        .select => {
-                            if (input.eqlDescription("q")) {
-                                self.view = .power;
-                                self.power = .shutdown;
-                                try self.renderBar();
-                                try self.renderHome();
-                                try self.renderPower();
-                            } else if (input.eqlDescription("i")) {
-                                self.mode = .insert;
-                                self.cursor = 0;
-                                try self.renderBar();
-                                try self.renderHome();
-                            } else if (input.eqlDescription("a") or input.eqlDescription("A")) {
-                                self.mode = .insert;
-                                self.cursor = switch (self.field) {
-                                    .username => self.username.len,
-                                    .password => self.password.len,
-                                };
-                                try self.renderBar();
-                                try self.renderHome();
-                            } else if (input.eqlDescription("j")) {
-                                self.field = .password;
-                                try self.renderHome();
-                            } else if (input.eqlDescription("k")) {
-                                self.field = .username;
-                                try self.renderHome();
-                            } else if (input.eqlDescription("d")) {
-                                switch (self.field) {
-                                    .username => self.username.len = 0,
-                                    .password => self.password.len = 0,
-                                }
-                                try self.renderHome();
-                            }
-                        },
-                    },
-                    .power => {
-                        debug.assert(self.mode == .select);
-                        if (input.eqlDescription("escape")) {
-                            self.view = .home;
-                            try self.renderBar();
-                            try self.renderHome();
-                        } else if (input.eqlDescription("enter")) {
-                            return .{ .power = switch (self.power) {
-                                .shutdown => "poweroff",
-                                .reboot => "reboot",
-                            } };
-                        } else if (input.eqlDescription("j")) {
-                            self.power = .reboot;
-                            try self.renderPower();
-                        } else if (input.eqlDescription("k")) {
-                            self.power = .shutdown;
-                            try self.renderPower();
-                        }
-                    },
+            if (try self.processPendingInput(false)) |action| return action;
+        }
+    }
+
+    fn processPendingInput(self: *Loop, flush_escape: bool) !?Action {
+        const bytes = self.pending_input.constSlice();
+        var consumed: usize = 0;
+        while (parseKey(bytes[consumed..], flush_escape)) |parsed| {
+            consumed += parsed.len;
+            if (parsed.key) |key| {
+                if (try self.processKey(key)) |action| {
+                    self.pending_input.len = 0;
+                    return action;
                 }
             }
         }
+
+        self.discardPendingInput(consumed);
+        return null;
+    }
+
+    fn discardPendingInput(self: *Loop, count: usize) void {
+        const remaining = self.pending_input.constSlice()[count..];
+        std.mem.copyForwards(u8, self.pending_input.slice()[0..remaining.len], remaining);
+        self.pending_input.len = @intCast(remaining.len);
+    }
+
+    fn processKey(self: *Loop, key: Key) !?Action {
+        if (self.handleKey(key)) |action| {
+            switch (action) {
+                .login => try self.renderSplash(),
+                .power => {},
+            }
+            return action;
+        }
+
+        try self.renderHome();
+        if (self.view == .power) try self.renderPower();
+        return null;
+    }
+
+    fn handleKey(self: *Loop, key: Key) ?Action {
+        switch (self.view) {
+            .home => switch (key) {
+                .escape => {
+                    self.view = .power;
+                    self.power = .reboot;
+                    self.select_all = false;
+                },
+                .tab, .back_tab => {
+                    self.field = switch (self.field) {
+                        .username => .password,
+                        .password => .username,
+                    };
+                    self.select_all = false;
+                },
+                .enter => switch (self.field) {
+                    .username => {
+                        self.field = .password;
+                        self.select_all = false;
+                    },
+                    .password => return .{ .login = .{
+                        .username = self.username.constSlice(),
+                        .password = self.password.constSlice(),
+                    } },
+                },
+                .select_all => {
+                    self.select_all = true;
+                    self.currentCursor().* = self.currentText().len;
+                },
+                .left => {
+                    const cursor = self.currentCursor();
+                    if (self.select_all) {
+                        cursor.* = 0;
+                    } else {
+                        cursor.* -|= 1;
+                    }
+                    self.select_all = false;
+                },
+                .up => {
+                    self.currentCursor().* = 0;
+                    self.select_all = false;
+                },
+                .right => {
+                    const cursor = self.currentCursor();
+                    const text = self.currentText();
+                    if (self.select_all) {
+                        cursor.* = text.len;
+                    } else {
+                        cursor.* = @min(cursor.* + 1, text.len);
+                    }
+                    self.select_all = false;
+                },
+                .down => {
+                    self.currentCursor().* = self.currentText().len;
+                    self.select_all = false;
+                },
+                .backspace => {
+                    const text = self.currentText();
+                    const cursor = self.currentCursor();
+                    if (self.select_all) {
+                        text.len = 0;
+                        cursor.* = 0;
+                        self.select_all = false;
+                    } else if (cursor.* > 0) {
+                        _ = text.orderedRemove(cursor.* - 1);
+                        cursor.* -= 1;
+                    }
+                },
+                .character => |char| {
+                    const text = self.currentText();
+                    const cursor = self.currentCursor();
+                    if (self.select_all) {
+                        text.len = 0;
+                        cursor.* = 0;
+                        self.select_all = false;
+                    }
+                    text.insert(cursor.*, char) catch return null;
+                    cursor.* += 1;
+                },
+            },
+            .power => switch (key) {
+                .escape => self.view = .home,
+                .enter => return .{ .power = self.power },
+                .up => self.power = switch (self.power) {
+                    .reboot => .reboot,
+                    .firmware => .reboot,
+                    .shutdown => .firmware,
+                },
+                .down => self.power = switch (self.power) {
+                    .reboot => .firmware,
+                    .firmware => .shutdown,
+                    .shutdown => .shutdown,
+                },
+                .tab => self.power = switch (self.power) {
+                    .reboot => .firmware,
+                    .firmware => .shutdown,
+                    .shutdown => .reboot,
+                },
+                .back_tab => self.power = switch (self.power) {
+                    .reboot => .shutdown,
+                    .firmware => .reboot,
+                    .shutdown => .firmware,
+                },
+                else => {},
+            },
+        }
+        return null;
+    }
+
+    fn currentText(self: *Loop) *std.BoundedArray(u8, 1024) {
+        return switch (self.field) {
+            .username => &self.username,
+            .password => &self.password,
+        };
+    }
+
+    fn currentCursor(self: *Loop) *usize {
+        return switch (self.field) {
+            .username => &self.username_cursor,
+            .password => &self.password_cursor,
+        };
     }
     fn renderHome(self: *Loop) !void {
         try self.term.fetchSize();
@@ -255,7 +351,8 @@ pub const Loop = struct {
         try drawField(rc, username, .{
             .label = "username",
             .hidden = false,
-            .selected = self.view == .home and self.mode == .select and self.field == .username,
+            .cursor = self.username_cursor,
+            .selected = self.view == .home and self.field == .username and self.select_all,
         }, .{
             .width = title_width,
             .height = field_height,
@@ -265,7 +362,8 @@ pub const Loop = struct {
         try drawField(rc, password, .{
             .label = "password",
             .hidden = true,
-            .selected = self.view == .home and self.mode == .select and self.field == .password,
+            .cursor = self.password_cursor,
+            .selected = self.view == .home and self.field == .password and self.select_all,
         }, .{
             .width = title_width,
             .height = field_height,
@@ -274,12 +372,15 @@ pub const Loop = struct {
         });
         try self.renderBar();
 
-        if (self.view == .home and self.mode == .insert) {
+        if (self.view == .home) {
             const cursor_y = switch (self.field) {
                 .username => username_top + 1 + (field_height - 1) / 2,
                 .password => password_top + 1 + (field_height - 1) / 2,
             };
-            const cursor_x = hpad + 2 + @min(self.cursor, title_width - 5);
+            const text = self.currentText();
+            const cursor = self.currentCursor().*;
+            const viewport_start = textViewportStart(text.len, cursor, title_width - 5);
+            const cursor_x = hpad + 2 + cursor - viewport_start;
             try rc.moveCursorTo(cursor_y, cursor_x);
             try rc.showCursor();
         }
@@ -361,8 +462,8 @@ pub const Loop = struct {
         try rc.hideCursor();
 
         const btn_height = 3;
-        const width = 16;
-        const height = btn_height * 2 + 2;
+        const width = 24;
+        const height = btn_height * 3 + 2;
 
         const hpad = (self.term.width - width) / 2;
         const vpad = (self.term.height - height) / 2;
@@ -373,17 +474,6 @@ pub const Loop = struct {
             .left = hpad,
             .top = vpad,
         });
-        try drawText(rc, "shutdown", .{
-            .hidden = false,
-            .selected = self.power == .shutdown,
-            .halign = .center,
-            .valign = .center,
-        }, .{
-            .width = width - 2,
-            .height = 3,
-            .left = hpad + 1,
-            .top = vpad + 1,
-        });
         try drawText(rc, "reboot", .{
             .hidden = false,
             .selected = self.power == .reboot,
@@ -393,7 +483,29 @@ pub const Loop = struct {
             .width = width - 2,
             .height = 3,
             .left = hpad + 1,
+            .top = vpad + 1,
+        });
+        try drawText(rc, "reboot to firmware", .{
+            .hidden = false,
+            .selected = self.power == .firmware,
+            .halign = .center,
+            .valign = .center,
+        }, .{
+            .width = width - 2,
+            .height = 3,
+            .left = hpad + 1,
             .top = vpad + 4,
+        });
+        try drawText(rc, "shut down", .{
+            .hidden = false,
+            .selected = self.power == .shutdown,
+            .halign = .center,
+            .valign = .center,
+        }, .{
+            .width = width - 2,
+            .height = 3,
+            .left = hpad + 1,
+            .top = vpad + 7,
         });
     }
 
@@ -405,28 +517,19 @@ pub const Loop = struct {
         while (i < self.term.width) : (i += 1) {
             try rc.writeAllWrapping("\u{2500}");
         }
-        const mode = switch (self.mode) {
-            .insert => "INSERT",
-            .select => "SELECT",
-        };
-        const help = switch (self.mode) {
-            .insert => switch (self.field) {
-                .username => "enter: password, esc: select mode",
-                .password => "enter: login, esc: select mode",
+        const help = switch (self.view) {
+            .home => switch (self.field) {
+                .username => "tab: switch, enter: password, esc: power",
+                .password => "tab: switch, enter: login, esc: power",
             },
-            .select => switch (self.view) {
-                .home => "q: power, i: insert, a: append, d: delete, j: down, k: up",
-                .power => "enter: commit, j: down, k: up",
-            },
+            .power => "up/down/tab: select, enter: commit, esc: back",
         };
         try rc.moveCursorTo(self.term.height - 1, 1);
         var rpw = rc.restrictedPaddingWriter(self.term.width - 2);
         const writer = rpw.writer();
 
-        try writer.writeAll(mode);
-        try writer.writeByteNTimes(' ', rpw.len_left - help.len);
         try writer.writeAll(help);
-        try rpw.finish();
+        try rpw.pad();
     }
 
     fn renderSplash(self: *Loop) !void {
@@ -447,6 +550,58 @@ pub const Loop = struct {
         }
     }
 };
+
+const ParsedKey = struct {
+    key: ?Loop.Key,
+    len: usize,
+};
+
+fn parseKey(bytes: []const u8, flush_escape: bool) ?ParsedKey {
+    if (bytes.len == 0) return null;
+
+    if (bytes[0] == '\x1b') {
+        if (bytes.len == 1) {
+            return if (flush_escape) .{ .key = .escape, .len = 1 } else null;
+        }
+        if (bytes[1] != '[' and bytes[1] != 'O') {
+            return .{ .key = .escape, .len = 1 };
+        }
+        if (bytes.len < 3) {
+            return if (flush_escape) .{ .key = .escape, .len = 1 } else null;
+        }
+
+        const key: ?Loop.Key = switch (bytes[2]) {
+            'A' => .up,
+            'B' => .down,
+            'C' => .right,
+            'D' => .left,
+            'Z' => if (bytes[1] == '[') .back_tab else null,
+            else => null,
+        };
+        if (key != null or ascii.isAlphabetic(bytes[2])) {
+            return .{ .key = key, .len = 3 };
+        }
+
+        for (bytes[2..], 2..) |byte, index| {
+            if (ascii.isAlphabetic(byte) or byte == '~') {
+                return .{ .key = null, .len = index + 1 };
+            }
+        }
+        return if (flush_escape) .{ .key = .escape, .len = 1 } else null;
+    }
+
+    return .{
+        .key = switch (bytes[0]) {
+            '\x01' => .select_all,
+            '\t' => .tab,
+            '\n', '\r' => .enter,
+            8, 127 => .backspace,
+            else => if (ascii.isPrint(bytes[0])) .{ .character = bytes[0] } else null,
+        },
+        .len = 1,
+    };
+}
+
 const Box = struct {
     width: usize,
     height: usize,
@@ -532,6 +687,7 @@ fn drawText(rc: *spoon.Term.RenderContext, text: []const u8, options: TextOption
 const FieldOptions = struct {
     label: []const u8,
     hidden: bool,
+    cursor: usize,
     selected: bool,
 };
 fn drawField(rc: *spoon.Term.RenderContext, text: []const u8, options: FieldOptions, box: Box) !void {
@@ -544,15 +700,177 @@ fn drawField(rc: *spoon.Term.RenderContext, text: []const u8, options: FieldOpti
         .left = box.left,
         .top = box.top + 1,
     });
-    try drawText(rc, text, .{
-        .hidden = options.hidden,
-        .selected = options.selected,
-        .halign = .left,
-        .valign = .center,
-    }, .{
+    try drawEditableText(rc, text, options, .{
         .width = box.width - 4,
         .height = box.height - 3,
         .left = box.left + 2,
         .top = box.top + 2,
     });
+}
+
+fn drawEditableText(rc: *spoon.Term.RenderContext, text: []const u8, options: FieldOptions, box: Box) !void {
+    const capacity = box.width - 1;
+    const start = textViewportStart(text.len, options.cursor, capacity);
+    const end = @min(text.len, start + capacity);
+
+    try rc.moveCursorTo(box.top, box.left);
+    var rpw = rc.restrictedPaddingWriter(box.width);
+    const writer = rpw.writer();
+    try rc.setAttribute(.{ .reverse = options.selected });
+    for (text[start..end]) |char| {
+        const codepoint: []const u8 = if (options.hidden) "\u{2022}" else &.{char};
+        try writer.writeAll(codepoint);
+    }
+    try rc.setAttribute(.{ .reverse = false });
+    try rpw.pad();
+}
+
+fn textViewportStart(text_len: usize, cursor: usize, capacity: usize) usize {
+    const end = @min(text_len, @max(capacity, cursor));
+    return end -| capacity;
+}
+
+test "form edits text and retains field cursors" {
+    var loop: Loop = .{ .term = undefined };
+
+    for ("iajkdq") |char| _ = loop.handleKey(.{ .character = char });
+    try std.testing.expectEqualStrings("iajkdq", loop.username.constSlice());
+    try std.testing.expectEqual(@as(usize, 6), loop.username_cursor);
+
+    _ = loop.handleKey(.left);
+    _ = loop.handleKey(.up);
+    try std.testing.expectEqual(@as(usize, 0), loop.username_cursor);
+    _ = loop.handleKey(.right);
+    _ = loop.handleKey(.down);
+    try std.testing.expectEqual(@as(usize, 6), loop.username_cursor);
+
+    _ = loop.handleKey(.tab);
+    try std.testing.expectEqual(.password, loop.field);
+    _ = loop.handleKey(.{ .character = 'x' });
+    _ = loop.handleKey(.back_tab);
+    try std.testing.expectEqual(.username, loop.field);
+    try std.testing.expectEqual(@as(usize, 6), loop.username_cursor);
+    _ = loop.handleKey(.tab);
+    try std.testing.expectEqual(@as(usize, 1), loop.password_cursor);
+}
+
+test "select all replaces, clears, and moves to either edge" {
+    var loop: Loop = .{ .term = undefined };
+    try loop.username.appendSlice("hello");
+    loop.username_cursor = loop.username.len;
+
+    _ = loop.handleKey(.select_all);
+    _ = loop.handleKey(.left);
+    try std.testing.expect(!loop.select_all);
+    try std.testing.expectEqual(@as(usize, 0), loop.username_cursor);
+    try std.testing.expectEqualStrings("hello", loop.username.constSlice());
+
+    _ = loop.handleKey(.select_all);
+    _ = loop.handleKey(.right);
+    try std.testing.expectEqual(loop.username.len, loop.username_cursor);
+    try std.testing.expectEqualStrings("hello", loop.username.constSlice());
+
+    _ = loop.handleKey(.select_all);
+    _ = loop.handleKey(.up);
+    try std.testing.expectEqual(@as(usize, 0), loop.username_cursor);
+    _ = loop.handleKey(.select_all);
+    _ = loop.handleKey(.down);
+    try std.testing.expectEqual(loop.username.len, loop.username_cursor);
+
+    _ = loop.handleKey(.select_all);
+    _ = loop.handleKey(.{ .character = 'x' });
+    try std.testing.expectEqualStrings("x", loop.username.constSlice());
+    try std.testing.expectEqual(@as(usize, 1), loop.username_cursor);
+
+    _ = loop.handleKey(.select_all);
+    _ = loop.handleKey(.backspace);
+    try std.testing.expectEqualStrings("", loop.username.constSlice());
+    try std.testing.expectEqual(@as(usize, 0), loop.username_cursor);
+}
+
+test "enter submits from password and power menu navigates all actions" {
+    var loop: Loop = .{ .term = undefined };
+    try loop.username.appendSlice("user");
+    try loop.password.appendSlice("secret");
+
+    try std.testing.expect(loop.handleKey(.enter) == null);
+    try std.testing.expectEqual(.password, loop.field);
+
+    const login = loop.handleKey(.enter).?;
+    switch (login) {
+        .login => |fields| {
+            try std.testing.expectEqualStrings("user", fields.username);
+            try std.testing.expectEqualStrings("secret", fields.password);
+        },
+        else => return error.UnexpectedAction,
+    }
+
+    _ = loop.handleKey(.escape);
+    try std.testing.expectEqual(.power, loop.view);
+    try std.testing.expectEqual(.reboot, loop.power);
+    _ = loop.handleKey(.down);
+    try std.testing.expectEqual(.firmware, loop.power);
+    const power = loop.handleKey(.enter).?;
+    switch (power) {
+        .power => |power_action| try std.testing.expectEqual(.firmware, power_action),
+        else => return error.UnexpectedAction,
+    }
+
+    _ = loop.handleKey(.down);
+    try std.testing.expectEqual(.shutdown, loop.power);
+    _ = loop.handleKey(.up);
+    try std.testing.expectEqual(.firmware, loop.power);
+    _ = loop.handleKey(.tab);
+    try std.testing.expectEqual(.shutdown, loop.power);
+    _ = loop.handleKey(.tab);
+    try std.testing.expectEqual(.reboot, loop.power);
+    _ = loop.handleKey(.back_tab);
+    try std.testing.expectEqual(.shutdown, loop.power);
+
+    _ = loop.handleKey(.escape);
+    try std.testing.expectEqual(.home, loop.view);
+}
+
+test "full field does not move cursor after failed insertion" {
+    var loop: Loop = .{ .term = undefined };
+    while (loop.username.len < loop.username.capacity()) try loop.username.append('x');
+    loop.username_cursor = loop.username.len;
+
+    _ = loop.handleKey(.{ .character = 'y' });
+    try std.testing.expectEqual(loop.username.len, loop.username_cursor);
+}
+
+test "raw input maps form navigation and select all" {
+    const cases = .{
+        .{ "\x1b[D", Loop.Key.left },
+        .{ "\x1b[C", Loop.Key.right },
+        .{ "\x1b[A", Loop.Key.up },
+        .{ "\x1b[B", Loop.Key.down },
+        .{ "\x1b[Z", Loop.Key.back_tab },
+        .{ "\t", Loop.Key.tab },
+        .{ "\x01", Loop.Key.select_all },
+    };
+
+    inline for (cases) |case| {
+        const parsed = parseKey(case[0], false).?;
+        const actual = parsed.key.?;
+        try std.testing.expect(std.meta.eql(case[1], actual));
+        try std.testing.expectEqual(case[0].len, parsed.len);
+    }
+}
+
+test "raw input waits for complete escape sequences" {
+    try std.testing.expect(parseKey("\x1b", false) == null);
+    try std.testing.expect(parseKey("\x1b[", false) == null);
+
+    const escape = parseKey("\x1b", true).?;
+    try std.testing.expect(std.meta.eql(Loop.Key.escape, escape.key.?));
+    try std.testing.expectEqual(@as(usize, 1), escape.len);
+}
+
+test "text viewport keeps the cursor visible" {
+    try std.testing.expectEqual(@as(usize, 0), textViewportStart(20, 0, 10));
+    try std.testing.expectEqual(@as(usize, 0), textViewportStart(20, 10, 10));
+    try std.testing.expectEqual(@as(usize, 1), textViewportStart(20, 11, 10));
+    try std.testing.expectEqual(@as(usize, 10), textViewportStart(20, 20, 10));
 }
