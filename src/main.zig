@@ -27,9 +27,6 @@ pub const std_options: std.Options = .{
 
 var loop: ui.Loop = .{
     .term = undefined,
-    .mode = .select,
-    .view = .home,
-    .field = .username,
 };
 
 pub fn main() !void {
@@ -61,7 +58,7 @@ pub fn main() !void {
     };
     if (params.args.user) |username| {
         try loop.username.appendSlice(username);
-        loop.mode = .insert;
+        loop.username_cursor = loop.username.len;
         loop.field = .password;
     }
 
@@ -105,11 +102,16 @@ pub fn main() !void {
                     .failed => try loop.resetAfterFailedLogin(),
                 }
             },
-            .power => |subcommand| {
+            .power => |power_action| {
                 loop.deinit();
+                const argv: []const []const u8 = switch (power_action) {
+                    .reboot => &.{ "systemctl", "reboot" },
+                    .firmware => &.{ "systemctl", "reboot", "--firmware-setup" },
+                    .shutdown => &.{ "systemctl", "poweroff" },
+                };
                 _ = try std.process.Child.run(.{
                     .allocator = allocator,
-                    .argv = &.{ "systemctl", subcommand },
+                    .argv = argv,
                 });
             },
         }
