@@ -21,6 +21,14 @@ const splash =
     \\| |__| |_| | |_| | |_| || || |\  | |_| |    | || |\  |    _   _   _
     \\|_____\___/ \____|\____|___|_| \_|\____|   |___|_| \_|   (_) (_) (_)
 ;
+
+fn artWidth(art: []const u8) usize {
+    var width: usize = 0;
+    var lines = mem.splitScalar(u8, art, '\n');
+    while (lines.next()) |line| width = @max(width, line.len);
+    return width;
+}
+
 pub const Loop = struct {
     term: spoon.Term,
     context: spoon.Term.RenderContext = undefined,
@@ -327,7 +335,7 @@ pub const Loop = struct {
         try rc.hideCursor();
 
         const title_height = mem.count(u8, title, "\n") + 1;
-        const title_width = mem.indexOfScalar(u8, title, '\n').?;
+        const title_width = artWidth(title);
 
         const title_spacing = 2;
         const field_spacing = 1;
@@ -528,8 +536,10 @@ pub const Loop = struct {
         var rpw = rc.restrictedPaddingWriter(self.term.width - 2);
         const writer = rpw.writer();
 
-        try writer.writeAll(help);
-        try rpw.pad();
+        const help_width = @min(help.len, rpw.len_left);
+        try writer.writeByteNTimes(' ', rpw.len_left - help_width);
+        try writer.writeAll(help[help.len - help_width ..]);
+        try rpw.finish();
     }
 
     fn renderSplash(self: *Loop) !void {
@@ -537,7 +547,7 @@ pub const Loop = struct {
         try rc.clear();
         try rc.hideCursor();
         const splash_height = mem.count(u8, splash, "\n") + 1;
-        const splash_width = mem.indexOfScalar(u8, splash, '\n').?;
+        const splash_width = artWidth(splash);
 
         const vpad = (self.term.height - splash_height) / 2;
         const hpad = (self.term.width - splash_width) / 2;
@@ -728,6 +738,11 @@ fn drawEditableText(rc: *spoon.Term.RenderContext, text: []const u8, options: Fi
 fn textViewportStart(text_len: usize, cursor: usize, capacity: usize) usize {
     const end = @min(text_len, @max(capacity, cursor));
     return end -| capacity;
+}
+
+test "ASCII art retains its original layout width" {
+    try std.testing.expectEqual(@as(usize, 58), artWidth(title));
+    try std.testing.expectEqual(@as(usize, 68), artWidth(splash));
 }
 
 test "form edits text and retains field cursors" {
